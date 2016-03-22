@@ -336,6 +336,18 @@ struct variable shell_var;
 
 char cmd_prefix = '\t';
 
+/* For the -F/--fork-hack option */
+#define FORK_HACK_PID_FILE ".make-fork-hack.pid"
+static int is_forked = 0;
+static int use_fork_hack = 0;
+static void fork_hack_signal_handler(int sig)
+{
+    if(use_fork_hack && !is_forked)
+        remove(FORK_HACK_PID_FILE);
+    exit(130);
+}
+
+
 
 /* The usage output.  We write it this way to make life easier for the
    translators, especially those trying to translate to right-to-left
@@ -363,6 +375,12 @@ static const char *const usage[] =
     N_("\
   -f FILE, --file=FILE, --makefile=FILE\n\
                               Read FILE as a makefile.\n"),
+    N_("\
+  -F, --fork-hack             Parses all makefiles, then waits for SIGUSR1, forks\n\
+                              when it arrives and continues in the forked child.\n\
+                              This eliminates parsing the same makefiles on every\n\
+                              'make' over and over again.\n\
+                              WARNING: THIS IS A HACK AND MIGHT BREAK EVERYTHING!\n"),
     N_("\
   -h, --help                  Print this message and exit.\n"),
     N_("\
@@ -432,6 +450,7 @@ static const struct command_switch switches[] =
     { 'D', flag, &suspend_flag, 1, 1, 0, 0, 0, "suspend-for-debug" },
 #endif
     { 'e', flag, &env_overrides, 1, 1, 0, 0, 0, "environment-overrides", },
+    { 'F', flag, &use_fork_hack, 1, 0, 0, 0, 0, "fork-hack", },
     { 'h', flag, &print_usage_flag, 0, 0, 0, 0, 0, "help" },
     { 'i', flag, &ignore_errors_flag, 1, 1, 0, 0, 0, "ignore-errors" },
     { 'k', flag, &keep_going_flag, 1, 1, 0, 0, &default_keep_going_flag,
@@ -1537,6 +1556,27 @@ main (int argc, char **argv, char **envp)
       die (MAKE_SUCCESS);
     }
 
+  /* Trigger build on fork-hack daemon */
+  if(use_fork_hack)
+    {
+      FILE *f = fopen(FORK_HACK_PID_FILE, "r");
+      if(f)
+        {
+          char buf[64] = { 0 };
+          char *res UNUSED = fgets(buf, sizeof(buf), f);
+          fclose(f);
+
+          pid_t daemon_pid = atoi(buf);
+          if(daemon_pid > 0 && kill(daemon_pid, SIGUSR1) == 0)
+            {
+              printf("Sent SIGUSR to %d, exiting.\n", daemon_pid);
+              die(0);
+            }
+        }
+
+      signal(SIGINT, fork_hack_signal_handler);
+    }
+
   if (ISDB (DB_BASIC))
     print_version ();
 
@@ -2033,7 +2073,7 @@ main (int argc, char **argv, char **envp)
 #endif
 
 #ifdef MAKE_JOBSERVER
-  if (job_slots > 1)
+  if (job_slots > 1 && (!use_fork_hack || is_forked))
     {
       /* If we have >1 slot at this point, then we're a top-level make.
          Set up the jobserver.
@@ -2137,6 +2177,52 @@ main (int argc, char **argv, char **envp)
 
   OUTPUT_UNSET ();
   output_close (&make_sync);
+
+  /* FORK HACK: wait for SIGUSR1 here, then fork and continue
+     with build in the child.*/
+  if(use_fork_hack)
+    {
+      sigset_t mask;
+      sigemptyset(&mask);
+      sigaddset(&mask, SIGUSR1);
+      sigprocmask(SIG_BLOCK, &mask, NULL);
+
+      FILE *f = fopen(FORK_HACK_PID_FILE, "w");
+      if(f)
+        {
+          fprintf(f, "%d\n", getpid());
+          fclose(f);
+        }
+
+      while(1)
+        {
+          int recv;
+          printf("\n\aWaiting for SIGUSR1, command to spawn child and continue: "
+                 "kill -USR1 %d or %s -F in the same folder\n\n", getpid(), argv[0]);
+          if(sigwait(&mask, &recv) == 0)
+            {
+              pid_t p = fork();
+              if(p == 0) // child
+                {
+                  if(job_slots > 1)
+                  {
+                    jobserver_setup (job_slots - 1);
+                    master_job_slots = job_slots;
+                    job_slots = 0;
+                    jobserver_fds = jobserver_get_arg ();
+                  }
+                  is_forked = 1;
+                  break;
+                }
+              else
+                {
+                  printf("Started child with pid %d, waiting for it to finish\n", p);
+                  waitpid(p, &recv, 0);
+                }
+            }
+        }
+    }
+
 
   if (read_files != 0)
     {
